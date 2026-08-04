@@ -1,0 +1,171 @@
+# 构建并发布 v2rayG(v2ray-gui,Fyne GUI,内嵌 v2ray-core)的发行工作流
+#
+# 触发:
+#   - push v* tag(如 v1.2.3)→ 构建产物并发布为 draft GitHub Release
+#   - workflow_dispatch(手动)→ 仅构建与打包(无 tag,跳过发布)
+#
+# 说明:
+#   - Fyne 是 CGO 应用,跨架构编译使用官方 fyne-cross(docker 镜像内置各平台工具链)
+#   - v2ray-gui 模块位于仓库子目录,go.mod 通过 replace ../ 引用仓库根的 v2ray-core,
+#     因此 fyne-cross 必须从「仓库根」运行并把包参数设为 v2ray-gui
+#     (不能用 -dir v2ray-gui:那会把容器挂载根收窄到子目录,replace ../ 将解析失败)
+#   - fyne-cross 产物位于 fyne-cross/bin/<os>-<arch>/<name>,按 <os>-<arch> 目录区分架构
+#     (fyne-cross 的 -name/-output 是纯字符串,不支持 {{.OS}}/{{.Arch}} 模板)
+#   - deb/rpm 使用 nfpm(nfpm package -f <cfg> -p <deb|rpm> -t <out>)
+
+name: Build v2ray-gui Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # 使用本地 Go 工具链(不打散 setup-go 版本)
+  GOTOOLCHAIN: local
+  # tag 为 v1.2.3;手动触发(无 tag)时用占位版本,仅用于打包测试,不会发布
+  VER: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.0.0' }}
+
+jobs:
+  build:
+    name: Build and package v2ray-gui
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Add GOPATH/bin to PATH
+        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------------
+      # fyne-cross 跨架构构建(docker 镜像内置工具链)
+      # ---------------------------------------------------------------
+      - name: Install fyne-cross
+        run: go install github.com/fyne-io/fyne-cross@latest
+
+      - name: fyne-cross build Linux (amd64 / arm64 / arm / 386)
+        run: |
+          set -euxo pipefail
+          fyne-cross linux \
+            -arch amd64,arm64,arm,386 \
+            -name v2ray-gui \
+            -icon v2ray-gui/internal/app/assets/icon.png \
+            -app-version "${VER#v}" \
+            v2ray-gui
+        timeout-minutes: 60
+
+      - name: fyne-cross build Windows (amd64 / arm64 / 386)
+        run: |
+          set -euxo pipefail
+          fyne-cross windows \
+            -arch amd64,arm64,386 \
+            -name v2ray-gui \
+            -icon v2ray-gui/internal/app/assets/icon.png \
+            -app-version "${VER#v}" \
+            v2ray-gui
+        timeout-minutes: 60
+
+      # ---------------------------------------------------------------
+      # 收集 fyne-cross 产物(fyne-cross/bin/<os>-<arch>/),按平台打 zip
+      # zip 内附带 README.md 与 LICENSE
+      # ---------------------------------------------------------------
+      - name: Collect binaries and create portable zips
+        run: |
+          set -euxo pipefail
+          APP_VERSION="${VER#v}"
+          mkdir -p release
+          # 公共说明文件(LICENSE 优先取 v2ray-gui/ 下,不存在则回退到仓库根)
+          cp v2ray-gui/README.md release/README.md
+          if [ -f v2ray-gui/LICENSE ]; then
+            cp v2ray-gui/LICENSE release/LICENSE
+          else
+            cp LICENSE release/LICENSE
+          fi
+
+          # Linux:amd64 / arm64 / arm / 386
+          for arch in amd64 arm64 arm 386; do
+            bin="fyne-cross/bin/linux-${arch}/v2ray-gui"
+            [ -f "$bin" ] || { echo "missing: $bin"; exit 1; }
+            dir="release/v2ray-gui-linux-${arch}"
+            mkdir -p "$dir"
+            cp "$bin" "$dir/v2ray-gui"
+            cp release/README.md release/LICENSE "$dir/"
+            (cd release && zip -9r "v2ray-gui_${APP_VERSION}_linux_${arch}.zip" "v2ray-gui-linux-${arch}")
+          done
+
+          # Windows:amd64 / arm64 / 386(exe 单独 zip)
+          for arch in amd64 arm64 386; do
+            bin="fyne-cross/bin/windows-${arch}/v2ray-gui.exe"
+            [ -f "$bin" ] || { echo "missing: $bin"; exit 1; }
+            dir="release/v2ray-gui-windows-${arch}"
+            mkdir -p "$dir"
+            cp "$bin" "$dir/v2ray-gui.exe"
+            cp release/README.md release/LICENSE "$dir/"
+            (cd release && zip -9r "v2ray-gui_${APP_VERSION}_windows_${arch}.zip" "v2ray-gui-windows-${arch}")
+          done
+
+      # ---------------------------------------------------------------
+      # deb / rpm 打包(nfpm),amd64 / arm64
+      # ---------------------------------------------------------------
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+
+      - name: Package deb and rpm (amd64 / arm64)
+        run: |
+          set -euxo pipefail
+          APP_VERSION="${VER#v}"
+          for arch in amd64 arm64; do
+          case "$arch" in
+          amd64) rpm_arch="x86_64" ;;
+          arm64) rpm_arch="aarch64" ;;
+          esac
+          # 注意:heredoc 内容与 EOF 必须与块基准缩进一致,YAML 剥离后 bash 端全部回到列 0
+          cat > "nfpm-${arch}.yaml" <<EOF
+          name: v2ray-gui
+          arch: ${arch}
+          platform: linux
+          version: ${APP_VERSION}
+          maintainer: v2rayG <v2ray-gui@users.noreply.github.com>
+          homepage: https://github.com/v2fly/v2ray-core
+          license: GPL-3.0
+          description: v2rayG - Fyne GUI client with embedded v2ray-core
+          contents:
+            - src: fyne-cross/bin/linux-${arch}/v2ray-gui
+              dst: /usr/bin/v2ray-gui
+            - src: v2ray-gui/packaging/v2ray-gui.desktop
+              dst: /usr/share/applications/v2ray-gui.desktop
+            - src: v2ray-gui/internal/app/assets/icon.png
+              dst: /usr/share/icons/hicolor/512x512/apps/v2ray-gui.png
+          scripts:
+            postinstall: v2ray-gui/packaging/postinstall.sh
+          EOF
+          nfpm package -f "nfpm-${arch}.yaml" -p deb -t "release/v2ray-gui_${APP_VERSION}_${arch}.deb"
+          nfpm package -f "nfpm-${arch}.yaml" -p rpm -t "release/v2ray-gui-${APP_VERSION}.${rpm_arch}.rpm"
+          done
+
+      - name: List release artifacts
+        run: ls -lh release/
+
+      # ---------------------------------------------------------------
+      # 发布为 draft Release(仅 tag 推送时;draft 便于人工检查后再发布)
+      # ---------------------------------------------------------------
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.zip
+            release/*.deb
+            release/*.rpm
+          draft: true
+          generate_release_notes: true

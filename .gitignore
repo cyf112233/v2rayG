@@ -30,3 +30,8 @@ errorgen
 [._]*.un~
 
 .golangci.yml
+
+# v2ray-gui 构建产物
+/v2ray-gui/v2ray-gui
+/v2ray-gui/v2ray-gui.test
+/fyne-cross/

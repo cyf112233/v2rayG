@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=v2rayG
+Comment=V2Ray 图形化代理客户端
+Exec=/usr/bin/v2ray-gui
+Icon=v2ray-gui
+Terminal=false
+Categories=Network;
