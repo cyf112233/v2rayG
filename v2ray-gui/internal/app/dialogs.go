@@ -297,7 +297,7 @@ func applyServerToConfig(cfg *core.Config, existing, srv *core.Server) {
 }
 
 // SettingsDialog 显示设置对话框:基础设置(端口/系统代理/自动连接)+
-// 高级设置(20 项,映射到 v4 配置)。保存成功后写回 cfg.Settings 并持久化。
+// 高级设置(21 项,映射到 v4 配置 + 关闭窗口行为)。保存成功后写回 cfg.Settings 并持久化。
 func SettingsDialog(parent fyne.Window, cfg *core.Config, onSaved func()) {
 	st := cfg.Settings
 
@@ -397,6 +397,14 @@ func SettingsDialog(parent fyne.Window, cfg *core.Config, onSaved func()) {
 	tunMTU := scrollEntry()
 	tunMTU.SetText(strconv.Itoa(defaultInt(st.TunMTU, 1500)))
 
+	// 关闭窗口行为("" 视为未选择,首次关闭窗口时询问)。
+	closeAction := widget.NewSelect([]string{"最小化到托盘", "退出应用"}, nil)
+	if st.CloseAction == "quit" {
+		closeAction.SetSelected("退出应用")
+	} else {
+		closeAction.SetSelected("最小化到托盘")
+	}
+
 	tunWarn := widget.NewLabel("TUN 需要 root 权限运行,并会修改系统路由表,断开时自动还原")
 	tunWarn.Importance = widget.DangerImportance
 	if st.TunEnable {
@@ -433,6 +441,7 @@ func SettingsDialog(parent fyne.Window, cfg *core.Config, onSaved func()) {
 		widget.NewFormItem("TUN 网卡代理(需 root)", tunEnable),
 		widget.NewFormItem("TUN 子网", tunSubnet),
 		widget.NewFormItem("TUN MTU", tunMTU),
+		widget.NewFormItem("关闭窗口时", closeAction),
 	)
 	advScroll := container.NewScroll(container.NewVBox(advForm, tunWarn))
 	advScroll.SetMinSize(fyne.NewSize(560, 420))
@@ -463,6 +472,7 @@ func SettingsDialog(parent fyne.Window, cfg *core.Config, onSaved func()) {
 			forceDNS: forceDNS.Checked, dnsServers: dnsServers.Text,
 			proxyIgnore: proxyIgnore.Text, latencyTimeout: latencyTimeout.Text,
 			tunEnable: tunEnable.Checked, tunSubnet: tunSubnet.Text, tunMTU: tunMTU.Text,
+			closeAction: closeAction.Selected,
 		})
 		if err != nil {
 			dialog.ShowError(err, parent)
@@ -499,6 +509,7 @@ type collectArgs struct {
 	latencyTimeout                   string
 	tunEnable                        bool
 	tunSubnet, tunMTU                string
+	closeAction                      string
 }
 
 // collectSettings 校验设置表单并写回 Settings;任一校验失败返回错误且不修改。
@@ -562,6 +573,12 @@ func collectSettings(base core.Settings, a collectArgs) (core.Settings, error) {
 	base.TunEnable = a.tunEnable
 	base.TunSubnet = subnet
 	base.TunMTU = mtu
+	// 关闭窗口行为:界面文案映射为配置值("最小化到托盘"→"tray","退出应用"→"quit")。
+	// 用户保存过设置即视为已选择,不再在关闭时询问。
+	base.CloseAction = "tray"
+	if a.closeAction == "退出应用" {
+		base.CloseAction = "quit"
+	}
 	return base, nil
 }
 

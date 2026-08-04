@@ -50,6 +50,8 @@ type Settings struct {
 	AutoConnect    bool `json:"autoConnect"`
 	// RouteMode 是路由模式: global|rules|direct,空值视为 rules。
 	RouteMode string `json:"routeMode"`
+	// CloseAction 是关闭窗口时的行为:""(未选择,首次关闭时询问)|"tray"(最小化到托盘)|"quit"(退出应用)。
+	CloseAction string `json:"closeAction"`
 
 	// 高级设置(全部映射到 v4 配置)。
 	// LogLevel 是日志级别: debug|info|warning|error|none,默认 "warning"。

@@ -56,6 +56,12 @@ type guiApp struct {
 	ticker     *time.Ticker
 	stopTicker chan struct{}
 	lastStatus string // 上次状态栏内容指纹,updateStatus 变化检测用
+
+	// tray 是系统托盘(无 DBus 会话时为 nil 能力禁用);trayReady 表示托盘已就绪。
+	tray      *Tray
+	trayReady bool
+	// closeAsked 防止关闭行为询问对话框打开期间重复触发关闭拦截。
+	closeAsked bool
 }
 
 // Run 启动 GUI 主循环。
@@ -125,6 +131,19 @@ func Run() {
 			}
 		}
 	}
+
+	// 系统托盘:在独立 goroutine 运行(StartTray 阻塞);无 DBus 会话时自动跳过。
+	// 回调内一律经 fyne.Do 切回主线程再操作 UI;onReadySync 在托盘就绪后同步一次状态。
+	g.tray = NewTray(
+		func() { fyne.Do(func() { g.win.Show(); g.win.RequestFocus() }) }, // 显示主界面
+		g.trayToggle, // 代理开关
+		func(label string) { fyne.Do(func() { g.setRouteMode(label) }) }, // 路由模式
+		func() { fyne.Do(g.quitFromTray) },                               // 退出应用
+		iconData,
+	)
+	g.tray.onReadySync = g.refreshTray
+	go g.tray.StartTray()
+
 	g.fyneApp.Run()
 }
 
@@ -209,9 +228,14 @@ func routeModeLabel(v string) string {
 	}
 }
 
-// onRouteModeChanged 处理路由模式切换:写回配置并保存;
-// 核心运行中时断开并按新模式自动重连,立即生效。
+// onRouteModeChanged 是工具栏路由模式下拉的切换入口,复用 setRouteMode。
 func (g *guiApp) onRouteModeChanged(label string) {
+	g.setRouteMode(label)
+}
+
+// setRouteMode 切换路由模式:写回配置并保存;核心运行中时断开并按新模式自动重连,立即生效。
+// 工具栏下拉与托盘菜单共用;托盘路径需先经 fyne.Do 切回主线程。
+func (g *guiApp) setRouteMode(label string) {
 	v := routeModeValue(label)
 	if v == g.cfg.Settings.RouteMode {
 		return
@@ -224,6 +248,7 @@ func (g *guiApp) onRouteModeChanged(label string) {
 		g.disconnect()
 		g.connectTo(srv)
 	}
+	g.refreshTray()
 }
 
 // buildTable 构建服务器表格,第 0 行为表头。
@@ -433,8 +458,53 @@ func latencyText(s *core.Server) string {
 	return strconv.Itoa(s.LatencyMS) + " ms"
 }
 
-// onClose 关闭窗口时的清理:停止核心、恢复系统代理、保存配置。
+// onClose 关闭窗口时的入口:已记忆关闭行为则直接执行;
+// 未记忆时(CloseAction=="")首次询问,并记住选择供后续使用。
 func (g *guiApp) onClose() {
+	if g.closeAsked {
+		return
+	}
+	if g.cfg.Settings.CloseAction != "" {
+		g.performClose(g.cfg.Settings.CloseAction)
+		return
+	}
+	g.closeAsked = true
+	d := dialog.NewCustomConfirm("关闭窗口", "最小化到托盘", "退出应用",
+		widget.NewLabel("请选择关闭窗口时的默认行为(可在 设置 → 高级设置 中修改):"),
+		func(toTray bool) {
+			action := "quit"
+			if toTray {
+				action = "tray"
+			}
+			g.cfg.Settings.CloseAction = action
+			_ = g.cfg.Save()
+			// 提示已记住;确认后执行所选关闭行为(NewInformation 无回调,用 CustomConfirm)。
+			dialog.NewCustomConfirm("提示", "确定", "取消",
+				widget.NewLabel("已记住您的选择,可在 设置 → 高级设置 → 关闭窗口时 修改"),
+				func(ok bool) {
+					g.closeAsked = false
+					if ok {
+						g.performClose(action)
+					}
+				}, g.win).Show()
+		}, g.win)
+	d.SetOnClosed(func() { g.closeAsked = false }) // 对话框被 Esc 等取消时复位,允许重新询问
+	d.Show()
+}
+
+// performClose 按关闭行为执行:最小化到托盘(托盘可用时隐藏窗口),否则完整退出。
+func (g *guiApp) performClose(action string) {
+	if action == "tray" && g.tray != nil && g.tray.ready.Load() {
+		g.trayReady = true
+		g.win.Hide()
+		return
+	}
+	g.cleanup()
+	g.win.Close()
+}
+
+// cleanup 应用退出前的完整清理:停止刷新,还原 TUN 路由,停止核心,恢复系统代理,保存配置。
+func (g *guiApp) cleanup() {
 	if g.stopTicker != nil {
 		close(g.stopTicker)
 		g.stopTicker = nil
@@ -459,7 +529,49 @@ func (g *guiApp) onClose() {
 	}
 	// 停掉日志批量刷新,防止 flush 回调在应用退出后操作 UI。
 	g.logView.Close()
-	g.win.Close()
+}
+
+// quitFromTray 托盘"退出应用"的完整退出流程:清理 + 退出托盘 + 退出应用。
+// 由托盘回调经 fyne.Do 调用,运行在主线程。
+func (g *guiApp) quitFromTray() {
+	g.cleanup()
+	if g.tray != nil {
+		g.tray.StopTray()
+	}
+	g.fyneApp.Quit()
+}
+
+// trayToggle 托盘"代理开关"回调:有服务器则切换连接,无服务器则显示窗口并提示。
+func (g *guiApp) trayToggle() {
+	fyne.Do(func() {
+		if g.engine.Running() {
+			g.disconnect()
+			return
+		}
+		srv := g.currentSrv
+		if srv == nil {
+			srv = g.cfg.FindServer(g.cfg.LastServerID)
+		}
+		if srv == nil {
+			g.win.Show()
+			dialog.ShowInformation("提示", "请先添加或选中一个服务器", g.win)
+			return
+		}
+		g.connectTo(srv)
+	})
+}
+
+// refreshTray 将当前连接状态与路由模式同步到托盘菜单;托盘未就绪时跳过。
+func (g *guiApp) refreshTray() {
+	if g.tray == nil || !g.tray.ready.Load() {
+		return
+	}
+	g.trayReady = true
+	connState := "未连接"
+	if g.engine.Running() {
+		connState = "已连接 ✓"
+	}
+	g.tray.refreshTray(connState, routeModeLabel(g.cfg.Settings.RouteMode))
 }
 
 // importClipboard 从剪贴板按行导入服务器。
@@ -673,6 +785,7 @@ func (g *guiApp) connectTo(srv *core.Server) {
 		g.logView.Append("连接失败: " + err.Error())
 		dialog.ShowError(fmt.Errorf("连接失败:%v", err), g.win)
 		g.updateStatus()
+		g.refreshTray()
 		return
 	}
 	g.currentSrv = srv
@@ -691,6 +804,7 @@ func (g *guiApp) connectTo(srv *core.Server) {
 			g.logView.Append("TUN 路由配置失败: " + err.Error())
 			dialog.ShowError(fmt.Errorf("TUN 路由配置失败:%v", err), g.win)
 			g.updateStatus()
+			g.refreshTray()
 			return
 		}
 		g.tunActive = true
@@ -698,6 +812,7 @@ func (g *guiApp) connectTo(srv *core.Server) {
 		g.proxyOn = false
 		g.proxyFail = false
 		g.updateStatus()
+		g.refreshTray()
 		return
 	}
 	if g.cfg.Settings.SetSystemProxy {
@@ -715,6 +830,7 @@ func (g *guiApp) connectTo(srv *core.Server) {
 		g.proxyFail = false
 	}
 	g.updateStatus()
+	g.refreshTray()
 }
 
 // disconnect 断开连接:还原 TUN 路由,停止核心,恢复系统代理。
@@ -735,19 +851,21 @@ func (g *guiApp) disconnect() {
 	g.proxyOn = false
 	g.proxyFail = false
 	g.updateStatus()
+	g.refreshTray()
 }
 
 // settingsDialog 打开设置对话框。
 func (g *guiApp) settingsDialog() {
 	SettingsDialog(g.win, g.cfg, func() {
 		g.updateStatus()
+		g.refreshTray()
 	})
 }
 
 // aboutDialog 显示关于对话框。
 func (g *guiApp) aboutDialog() {
 	dialog.ShowInformation("关于",
-		"v2rayG v1.0.0\n\n基于 Fyne 内嵌 v2ray-core 的图形化代理客户端\n支持 vmess / vless / trojan / shadowsocks\n界面全中文,类 v2rayN 体验",
+		"v2rayG v1.0.1\n\n基于 Fyne 内嵌 v2ray-core 的图形化代理客户端\n支持 vmess / vless / trojan / shadowsocks\n界面全中文,类 v2rayN 体验",
 		g.win)
 }
 
