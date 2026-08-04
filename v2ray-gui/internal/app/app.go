@@ -66,6 +66,12 @@ type guiApp struct {
 
 // Run 启动 GUI 主循环。
 func Run() {
+	// 单实例:第二个实例启动时通知已有实例显示窗口并立即退出。
+	// 必须在任何 fyne 初始化之前执行;V2RAY_GUI_ELEVATED 延续进程跳过检查。
+	showReq := make(chan struct{}, 4)
+	if !acquireSingle(showReq) {
+		return
+	}
 	g := &guiApp{selected: -1}
 	g.fyneApp = app.NewWithID("com.v2ray.gui")
 	// 应用图标:启动器/任务栏与窗口共用(assets/icon.png,见 icon.go)。
@@ -104,6 +110,12 @@ func Run() {
 	}
 
 	g.buildUI()
+	// 单实例唤醒:其他实例启动时在此显示主窗口并抢焦点。
+	go func() {
+		for range showReq {
+			fyne.Do(func() { g.win.Show(); g.win.RequestFocus() })
+		}
+	}()
 	g.win.SetCloseIntercept(g.onClose)
 	g.win.Show()
 	if g.errAtStartup != nil {

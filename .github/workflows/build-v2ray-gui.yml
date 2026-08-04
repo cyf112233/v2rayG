@@ -91,6 +91,9 @@ jobs:
           sed 's|^Exec=.*|Exec=v2ray-gui|' v2ray-gui/packaging/v2ray-gui.desktop > AppDir/usr/share/applications/v2ray-gui.desktop
           cp AppDir/usr/share/applications/v2ray-gui.desktop AppDir/v2ray-gui.desktop
           cp v2ray-gui/internal/app/assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/v2ray-gui.png
+          # appimagetool 要求 desktop 文件 Icon= 对应的图标同时存在于 AppDir 根目录,
+          # 否则报 "v2ray-gui{.png,.svg,.xpm} defined in desktop file but not found"
+          cp v2ray-gui/internal/app/assets/icon.png AppDir/v2ray-gui.png
           echo '#!/bin/sh' > AppDir/AppRun
           echo 'SELF=$(readlink -f "$0"); HERE=${SELF%/*}; exec "$HERE/usr/bin/v2ray-gui" "$@"' >> AppDir/AppRun
           chmod +x AppDir/AppRun
