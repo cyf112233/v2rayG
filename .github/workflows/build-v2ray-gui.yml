@@ -60,14 +60,16 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          # fyne 的 glfw fork 同时编译 X11+Wayland 后端,缺 wayland 头文件会编译失败
+          # -tags x11:glfw 只编 X11 后端,无 wayland-client 依赖;libwayland-dev 保留无害
           sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev
 
       - name: Build v2ray-gui (native)
         run: |
           set -euxo pipefail
           cd v2ray-gui
-          go build -trimpath -ldflags "-s -w" -o v2ray-gui .
+          # -tags x11:强制 GLFW 走 X11/XWayland,使 window.SetIcon 真实写入 _NET_WM_ICON
+          # (默认构建在 Wayland 会话下 build.IsWayland 为真,SetIcon 被跳过,任务栏无图标)
+          go build -trimpath -ldflags "-s -w" -tags x11 -o v2ray-gui .
 
       - name: Package tar.gz portable archive
         run: |
