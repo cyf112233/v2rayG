@@ -5,13 +5,14 @@
 #   - workflow_dispatch(手动)→ 仅构建与打包(无 tag,跳过发布)
 #
 # 说明:
-#   - Fyne 是 CGO 应用;本工作流采用「原生分叉构建」,不做交叉编译:
+#   - Fyne 是 CGO 应用;本工作流以「原生构建」为主:
 #       * Linux amd64 → ubuntu-24.04(原生)
 #       * Linux arm64 → ubuntu-24.04-arm(公开仓库可用 arm64 原生 runner)
 #       * Windows amd64 → windows-latest(原生,choco 装 mingw 提供 cgo 的 gcc)
+#       * Windows arm64 → windows-latest 上用 llvm-mingw 交叉编译(不重复开 arm64 Windows runner)
 #   - 版本号从 tag 提取(去掉前导 v),workflow_dispatch 时回退 0.0.0
 #   - Linux 每架构产物:tar.gz 独立包 + AppImage + deb + rpm
-#   - Windows 产物:便携 zip + NSIS 安装程序(桌面快捷方式 + 卸载器)
+#   - Windows 产物:amd64 便携 zip + NSIS 安装程序(桌面快捷方式 + 卸载器);arm64 仅便携 zip
 #   - Windows 图标/版本资源用 go-winres simply 生成 .syso,由 go build 自动链接
 #   - 所有路径相对仓库根;GOTOOLCHAIN 不设(默认 auto,runner 上 go 1.26 已够)
 
@@ -59,7 +60,8 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+          # fyne 的 glfw fork 同时编译 X11+Wayland 后端,缺 wayland 头文件会编译失败
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev
 
       - name: Build v2ray-gui (native)
         run: |
@@ -143,10 +145,10 @@ jobs:
           if-no-files-found: error
 
   # ------------------------------------------------------------------
-  # Job 2: Windows 原生构建(windows-latest,amd64)
+  # Job 2: Windows 构建(windows-latest;amd64 原生 + arm64 用 llvm-mingw 交叉编译)
   # ------------------------------------------------------------------
   build-windows:
-    name: build-windows (amd64)
+    name: build-windows
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
@@ -210,6 +212,8 @@ jobs:
           set -euxo pipefail
           VER="${VER#v}"
           choco install nsis -y --no-progress
+          # choco 装的 NSIS 位于 C:\Program Files (x86)\NSIS,不在默认 PATH
+          export PATH="$PATH:/c/Program Files (x86)/NSIS"
           # -D 传参:VERSION 写进安装包与注册表,APP_ROOT/OUTDIR 为绝对路径(免去 NSIS 相对路径歧义)
           makensis "-DVERSION=${VER}" \
             "-DAPP_ROOT=${GITHUB_WORKSPACE//\\//}" \
@@ -217,13 +221,61 @@ jobs:
             v2ray-gui/packaging/installer.nsi
           ls -lh "release/v2rayG-Setup-${VER}.exe"
 
+      - name: Install llvm-mingw (aarch64-w64-mingw32 cross compiler)
+        run: |
+          set -euxo pipefail
+          # llvm-mingw 20260616 (LLVM 22.1.8,Latest stable);Windows x86_64 资产命名不带 windows 前缀
+          curl -fsSL -o llvm-mingw.zip https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-x86_64.zip
+          unzip -q llvm-mingw.zip
+          # 注意:glob 必须放在引号外才会展开,得到形如 llvm-mingw-20260616-ucrt-x86_64/bin
+          BIN_DIR=$(printf '%s\n' llvm-mingw-*/bin)
+          export PATH="$(pwd)/${BIN_DIR}:$PATH"
+          which aarch64-w64-mingw32-gcc
+          aarch64-w64-mingw32-gcc --version | head -1
+
+      - name: Embed icon and version resources for arm64 (go-winres)
+        run: |
+          set -euxo pipefail
+          VER="${VER#v}"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          cd v2ray-gui
+          # 生成 rsrc_windows_arm64.syso,与 amd64 的 .syso 共存,go build 按 GOARCH 自动选
+          go-winres simply \
+            --arch arm64 \
+            --icon internal/app/assets/icon.png \
+            --manifest gui \
+            --file-version "${VER}.0" --product-version "${VER}.0"
+          ls -l rsrc_windows_*.syso
+
+      - name: Build v2ray-gui-arm64.exe (cross compile)
+        run: |
+          set -euxo pipefail
+          BIN_DIR=$(printf '%s\n' llvm-mingw-*/bin)
+          export PATH="$(pwd)/${BIN_DIR}:$PATH"
+          cd v2ray-gui
+          CGO_ENABLED=1 GOOS=windows GOARCH=arm64 CC=aarch64-w64-mingw32-gcc \
+            go build -trimpath -ldflags "-s -w" -o v2ray-gui-arm64.exe .
+          SIZE=$(stat -c%s v2ray-gui-arm64.exe)
+          echo "v2ray-gui-arm64.exe size: $SIZE bytes"
+          [ "$SIZE" -gt 83886080 ] || echo "::warning::exe smaller than 80MB, embedded resources may be missing"
+
+      - name: Package arm64 portable zip
+        run: |
+          set -euxo pipefail
+          VER="${VER#v}"
+          mkdir -p "release/v2ray-gui-windows-arm64"
+          cp v2ray-gui/v2ray-gui-arm64.exe "release/v2ray-gui-windows-arm64/v2ray-gui.exe"
+          cp v2ray-gui/README.md v2ray-gui/LICENSE "release/v2ray-gui-windows-arm64/"
+          powershell -NoProfile -Command "Compress-Archive -Path 'release/v2ray-gui-windows-arm64/*' -DestinationPath 'release/v2ray-gui-${VER}-windows-arm64.zip' -Force"
+          # 注:arm64 不做 NSIS 安装器,仅便携 zip
+
       - name: List release artifacts
         run: ls -lh release/
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: v2ray-gui-windows-amd64
+          name: v2ray-gui-windows
           path: release/*
           if-no-files-found: error
 
