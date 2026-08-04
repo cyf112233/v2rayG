@@ -182,12 +182,13 @@ func applyAdvancedOutbound(out map[string]interface{}, st Settings) {
 
 // tunServices 生成根级 services.tun 配置(jsonpb 解析,snake_case 字段)。
 // ips 用 st.TunSubnet 解析(IPv4 4 字节 To4() base64),routes 固定 0.0.0.0/0。
+// st.TunFD>0 时附加 preopened_fd:核心直接用该 fd 创建设备,无需自身提权。
 func tunServices(st Settings) (map[string]interface{}, error) {
 	ipBase64, prefix, err := cidrToIPBase64(st.TunSubnet)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]interface{}{
+	tun := map[string]interface{}{
 		"name":            TunName,
 		"mtu":             st.TunMTU,
 		"user_level":      0,
@@ -206,10 +207,14 @@ func tunServices(st Settings) (map[string]interface{}, error) {
 			},
 		},
 		"sniffing_settings": map[string]interface{}{
-			"enabled":       true,
-			"dest_override": []interface{}{"http", "tls"},
+			"enabled":              true,
+			"destination_override": []interface{}{"http", "tls"},
 		},
-	}, nil
+	}
+	if st.TunFD > 0 {
+		tun["preopened_fd"] = st.TunFD
+	}
+	return tun, nil
 }
 
 // cidrToIPBase64 将 IPv4 网段(如 "10.0.0.1/24")编码为

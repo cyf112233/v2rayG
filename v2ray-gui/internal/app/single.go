@@ -5,7 +5,6 @@ package app
 
 import (
 	"net"
-	"os"
 	"strconv"
 	"time"
 )
@@ -14,11 +13,7 @@ const singlePort = 10880
 
 // acquireSingle 尝试成为主实例。返回 true 表示当前进程是主实例(需继续监听);
 // false 表示已有实例在运行(已通知其显示窗口),调用方应立即退出。
-// V2RAY_GUI_ELEVATED=1(pkexec 提权重启的延续进程)时跳过检查。
 func acquireSingle(show chan<- struct{}) bool {
-	if os.Getenv("V2RAY_GUI_ELEVATED") == "1" {
-		return true
-	}
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(singlePort))
 	// 先尝试连接:能连上说明已有主实例,通知它显示窗口。
 	if c, err := net.DialTimeout("tcp", addr, 500*time.Millisecond); err == nil {

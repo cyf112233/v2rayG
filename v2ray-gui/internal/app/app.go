@@ -21,6 +21,7 @@ import (
 
 	"v2ray-gui/internal/core"
 	"v2ray-gui/internal/engine"
+	"v2ray-gui/internal/helper"
 )
 
 var tableHeaders = []string{"名称", "协议", "地址", "端口", "TLS", "延迟"}
@@ -45,7 +46,11 @@ type guiApp struct {
 	proxyOn      bool
 	proxyFail    bool
 	// tunActive 表示 TUN 网卡路由是否已配置(断开时需还原)。
-	tunActive  bool
+	tunActive bool
+	// tunHelper 是常驻 root 助手客户端;tunFile 是助手创建的 TUN 设备 fd
+	// (常驻引用,防止 fd 号被复用;断开时关闭)。
+	tunHelper  *helper.Client
+	tunFile    *os.File
 	lastUp     int64 // 上一秒累计上行,用于计算实时速率
 	lastDown   int64 // 上一秒累计下行,用于计算实时速率
 	connectBtn *widget.Button
@@ -67,7 +72,7 @@ type guiApp struct {
 // Run 启动 GUI 主循环。
 func Run() {
 	// 单实例:第二个实例启动时通知已有实例显示窗口并立即退出。
-	// 必须在任何 fyne 初始化之前执行;V2RAY_GUI_ELEVATED 延续进程跳过检查。
+	// 必须在任何 fyne 初始化之前执行。
 	showReq := make(chan struct{}, 4)
 	if !acquireSingle(showReq) {
 		return
@@ -95,19 +100,8 @@ func Run() {
 		g.logView.Append(line)
 	})
 
-	// 启动时自动提权:TUN 开启且非 root 时,通过 pkexec 以 root 重启自身。
-	// 提权后的实例带 V2RAY_GUI_ELEVATED=1,不会再触发本逻辑;root 实例也不走。
-	// 提权失败时继续以普通权限运行,连接 TUN 时仍会二次提示。
-	var elevateErr error
-	if cfg.Settings.TunEnable && core.NeedsRoot() && os.Getenv("V2RAY_GUI_ELEVATED") != "1" {
-		if err := relaunchElevated(cfg.LastServerID); err != nil {
-			elevateErr = err
-		} else {
-			g.logView.Append("正在通过 pkexec 请求管理员权限...")
-			g.fyneApp.Quit()
-			return
-		}
-	}
+	// 不再启动时自动提权:那会让每次启动都弹 polkit 密码框。TUN 需要 root 时,
+	// 由用户点击"连接"后经常驻 root 助手(internal/helper)一次性认证执行。
 
 	g.buildUI()
 	// 单实例唤醒:其他实例启动时在此显示主窗口并抢焦点。
@@ -121,9 +115,6 @@ func Run() {
 	if g.errAtStartup != nil {
 		dialog.ShowError(fmt.Errorf("读取配置失败,已使用默认配置:%v", g.errAtStartup), g.win)
 	}
-	if elevateErr != nil {
-		dialog.ShowError(fmt.Errorf("无法通过 pkexec 提权:%v。TUN 需要 root,可手动用 pkexec ./v2ray-gui 启动", elevateErr), g.win)
-	}
 
 	// 启动时自动连接上次节点。
 	if g.cfg.Settings.AutoConnect && g.cfg.LastServerID != "" {
@@ -131,16 +122,6 @@ func Run() {
 			time.AfterFunc(500*time.Millisecond, func() {
 				fyne.Do(func() { g.connectTo(srv) })
 			})
-		}
-	}
-	// 提权实例自动连接:pkexec 重启后由 V2RAY_GUI_CONNECT 指定要连接的节点。
-	if os.Getenv("V2RAY_GUI_ELEVATED") == "1" {
-		if id := os.Getenv("V2RAY_GUI_CONNECT"); id != "" {
-			if srv := g.cfg.FindServer(id); srv != nil {
-				time.AfterFunc(500*time.Millisecond, func() {
-					fyne.Do(func() { g.connectTo(srv) })
-				})
-			}
 		}
 	}
 
@@ -516,6 +497,7 @@ func (g *guiApp) performClose(action string) {
 }
 
 // cleanup 应用退出前的完整清理:停止刷新,还原 TUN 路由,停止核心,恢复系统代理,保存配置。
+// 注意:退出时不向助手发送 quit,助手空闲 30 分钟自动退出,期间重启应用可免密复用。
 func (g *guiApp) cleanup() {
 	if g.stopTicker != nil {
 		close(g.stopTicker)
@@ -525,12 +507,18 @@ func (g *guiApp) cleanup() {
 		g.ticker.Stop()
 	}
 	// 先还原 TUN 路由(设备仍在),再停核心与系统代理。
-	if g.tunActive {
-		core.TunDown(g.cfg.Settings.TunSubnet)
+	if g.tunActive && g.tunHelper != nil {
+		_, _ = g.tunHelper.Run("route", "del", "default", "dev", core.TunName)
+		_, _ = g.tunHelper.Run("addr", "del", g.cfg.Settings.TunSubnet, "dev", core.TunName)
 		g.tunActive = false
 	}
 	if g.engine.Running() {
 		g.engine.Stop()
+	}
+	g.cfg.Settings.TunFD = 0
+	if g.tunFile != nil {
+		_ = g.tunFile.Close()
+		g.tunFile = nil
 	}
 	if g.proxyOn || g.proxyFail {
 		core.RestoreSystemProxy()
@@ -768,31 +756,18 @@ func (g *guiApp) toggleConnect() {
 	g.connectTo(g.cfg.Servers[g.selected])
 }
 
-// connectTo 连接指定服务器:启动内嵌核心,按需配置 TUN 路由或系统代理。
+// connectTo 连接指定服务器:启动内嵌核心;TUN 模式先经常驻 root 助手
+// 创建 TUN 设备并把 fd 注入核心(preopened_fd),网卡与路由由助手以 root 配置,
+// 应用自身保持非 root;非 TUN 模式走系统代理。
 func (g *guiApp) connectTo(srv *core.Server) {
 	if g.engine.Running() {
 		g.disconnect()
 	}
-	if g.cfg.Settings.TunEnable && core.NeedsRoot() {
-		// 提权后仍非 root(罕见,pkexec 被绕过时),保留原错误提示。
-		if os.Getenv("V2RAY_GUI_ELEVATED") == "1" {
-			dialog.ShowError(fmt.Errorf("TUN 网卡代理需要 root 权限,请用 pkexec ./v2ray-gui 或 sudo -E ./v2ray-gui 启动应用"), g.win)
-			return
-		}
-		// 普通权限:询问是否通过 pkexec 重启提权,重启后自动连接当前节点。
-		ConfirmDialog(g.win, "需要管理员权限",
-			"TUN 网卡代理需要 root 权限。\n是否通过 pkexec 以管理员权限重启应用?重启后将自动连接当前节点。",
-			func() {
-				if err := relaunchElevated(srv.ID); err != nil {
-					dialog.ShowError(fmt.Errorf("无法通过 pkexec 提权:%v", err), g.win)
-					return
-				}
-				g.logView.Append("正在通过 pkexec 请求管理员权限...")
-				g.fyneApp.Quit()
-			})
+	g.logView.Append("正在连接 " + srv.Name + " (" + srv.Address + ") ...")
+	if g.cfg.Settings.TunEnable {
+		g.connectTUN(srv)
 		return
 	}
-	g.logView.Append("正在连接 " + srv.Name + " (" + srv.Address + ") ...")
 	if err := g.engine.Start(srv, g.cfg.Settings); err != nil {
 		g.logView.Append("连接失败: " + err.Error())
 		dialog.ShowError(fmt.Errorf("连接失败:%v", err), g.win)
@@ -806,26 +781,6 @@ func (g *guiApp) connectTo(srv *core.Server) {
 	g.cfg.LastServerID = srv.ID
 	if err := g.cfg.Save(); err != nil {
 		g.logView.Append("保存配置失败: " + err.Error())
-	}
-	// TUN 网卡级代理:核心在进程内创建设备,系统侧路由用 ip 命令配置,
-	// 不需要系统代理。
-	if g.cfg.Settings.TunEnable {
-		if err := core.TunUp(g.cfg.Settings.TunSubnet); err != nil {
-			g.engine.Stop()
-			g.currentSrv = nil
-			g.logView.Append("TUN 路由配置失败: " + err.Error())
-			dialog.ShowError(fmt.Errorf("TUN 路由配置失败:%v", err), g.win)
-			g.updateStatus()
-			g.refreshTray()
-			return
-		}
-		g.tunActive = true
-		g.logView.Append("TUN 网卡代理已启用 (tun0),断开时自动还原路由")
-		g.proxyOn = false
-		g.proxyFail = false
-		g.updateStatus()
-		g.refreshTray()
-		return
 	}
 	if g.cfg.Settings.SetSystemProxy {
 		if err := core.SetSystemProxy(g.cfg.Settings); err != nil {
@@ -845,17 +800,102 @@ func (g *guiApp) connectTo(srv *core.Server) {
 	g.refreshTray()
 }
 
+// connectTUN 通过常驻 root 助手创建 TUN 设备,把 fd 注入核心,并配置网卡与路由。
+// 首次调用 EnsureClient 会弹出系统认证框(唯一一次密码),之后免密。
+func (g *guiApp) connectTUN(srv *core.Server) {
+	// fail 是 TUN 流程失败时的统一清理与提示:停核心、关设备 fd、复位状态。
+	fail := func(format string, args ...interface{}) {
+		g.engine.Stop()
+		g.currentSrv = nil
+		g.cfg.Settings.TunFD = 0
+		if g.tunFile != nil {
+			_ = g.tunFile.Close()
+			g.tunFile = nil
+		}
+		g.tunActive = false
+		g.logView.Append(fmt.Sprintf(format, args...))
+		dialog.ShowError(fmt.Errorf(format, args...), g.win)
+		g.updateStatus()
+		g.refreshTray()
+	}
+	g.logView.Append("需要管理员权限,将弹出系统认证框,输入密码后自动继续")
+	client, err := helper.EnsureClient()
+	if err != nil {
+		fail("需要管理员权限,将弹出系统认证框,输入密码后自动继续\n\n提权助手启动失败:%v", err)
+		return
+	}
+	g.tunHelper = client
+	tunFile, err := client.OpenTun(core.TunName)
+	if err != nil {
+		fail("创建 TUN 设备失败:%v", err)
+		return
+	}
+	g.tunFile = tunFile
+	// preopened_fd 是瞬态字段(json:"-"),仅本次启动传给核心,不持久化。
+	g.cfg.Settings.TunFD = int(tunFile.Fd())
+	if err := g.engine.Start(srv, g.cfg.Settings); err != nil {
+		fail("核心启动失败(含 TUN 设备):%v", err)
+		return
+	}
+	g.currentSrv = srv
+	g.cfg.LastServerID = srv.ID
+	if err := g.cfg.Save(); err != nil {
+		g.logView.Append("保存配置失败: " + err.Error())
+	}
+	// 网卡与路由由助手以 root 配置;重复连接时"已存在"类错误容忍。
+	steps := [][]string{
+		{"link", "set", core.TunName, "up"},
+		{"addr", "add", g.cfg.Settings.TunSubnet, "dev", core.TunName},
+		{"route", "add", "default", "dev", core.TunName},
+	}
+	for _, args := range steps {
+		out, err := client.Run(args...)
+		if err != nil && !tunIPErrorTolerable(err) {
+			fail("TUN 路由配置失败(ip %v):%v", strings.Join(args, " "), err)
+			return
+		}
+		if err != nil {
+			g.logView.Append(fmt.Sprintf("TUN: ip %v 已存在,忽略(%s)",
+				strings.Join(args, " "), strings.TrimSpace(out)))
+		}
+	}
+	g.tunActive = true
+	g.logView.Append("TUN 网卡代理已启用 (" + core.TunName + "),断开时自动还原路由")
+	g.proxyOn = false
+	g.proxyFail = false
+	g.logView.Append("核心已启动,SOCKS:" + strconv.Itoa(g.cfg.Settings.SocksPort) +
+		" HTTP:" + strconv.Itoa(g.cfg.Settings.HTTPPort))
+	g.updateStatus()
+	g.refreshTray()
+}
+
+// tunIPErrorTolerable 判断 ip 命令的"已存在"类错误(重复连接/路由已存在)是否可容忍。
+func tunIPErrorTolerable(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "File exists") || strings.Contains(msg, "已存在")
+}
+
 // disconnect 断开连接:还原 TUN 路由,停止核心,恢复系统代理。
+// 应用退出时不向助手发送 quit(空闲 30 分钟自退),重启应用可免密复用。
 func (g *guiApp) disconnect() {
 	g.currentSrv = nil
 	if g.tunActive {
-		core.TunDown(g.cfg.Settings.TunSubnet)
+		// 还原路由与地址(设备仍由助手持有;忽略错误)。
+		if g.tunHelper != nil {
+			_, _ = g.tunHelper.Run("route", "del", "default", "dev", core.TunName)
+			_, _ = g.tunHelper.Run("addr", "del", g.cfg.Settings.TunSubnet, "dev", core.TunName)
+		}
 		g.tunActive = false
 		g.logView.Append("TUN 路由已还原")
 	}
 	if g.engine.Running() {
 		g.engine.Stop()
 		g.logView.Append("核心已停止")
+	}
+	g.cfg.Settings.TunFD = 0
+	if g.tunFile != nil {
+		_ = g.tunFile.Close()
+		g.tunFile = nil
 	}
 	if g.proxyOn || g.proxyFail {
 		core.RestoreSystemProxy()

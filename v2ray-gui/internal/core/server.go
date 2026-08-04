@@ -93,6 +93,9 @@ type Settings struct {
 	TunSubnet string `json:"tunSubnet"`
 	// TunMTU 是 TUN 网卡 MTU,默认 1500。
 	TunMTU int `json:"tunMTU"`
+	// TunFD 是常驻 root 助手创建的 TUN 设备 fd(preopened_fd),瞬态字段:
+	// 仅本次连接传给核心,不持久化(json:"-")。
+	TunFD int `json:"-"`
 }
 
 // Config 是持久化到磁盘的整个 GUI 状态。

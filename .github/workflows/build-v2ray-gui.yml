@@ -133,6 +133,10 @@ jobs:
               dst: /usr/share/applications/v2ray-gui.desktop
             - src: v2ray-gui/internal/app/assets/icon.png
               dst: /usr/share/icons/hicolor/512x512/apps/v2ray-gui.png
+            - src: v2ray-gui/internal/app/assets/icon.png
+              dst: /usr/share/icons/hicolor/256x256/apps/v2ray-gui.png
+            - src: v2ray-gui/internal/app/assets/icon.png
+              dst: /usr/share/icons/hicolor/128x128/apps/v2ray-gui.png
           scripts:
             postinstall: v2ray-gui/packaging/postinstall.sh
           EOF

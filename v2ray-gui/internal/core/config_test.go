@@ -528,11 +528,10 @@ func TestBuildConfigAdvanced(t *testing.T) {
 	}
 	sniff := obj(tun, "sniffing_settings")
 	if sniff["enabled"] != true {
-		t.Errorf("tun.sniffing_settings.enabled=%v", sniff["enabled"])
+		t.Errorf("tun.sniffing_settings.enabled=%v, want true", sniff["enabled"])
 	}
-	dest := arr(sniff, "dest_override")
-	if len(dest) != 2 || dest[0] != "http" || dest[1] != "tls" {
-		t.Errorf("tun.sniffing_settings.dest_override=%v", dest)
+	if dest := arr(sniff, "destination_override"); len(dest) != 2 || dest[0] != "http" || dest[1] != "tls" {
+		t.Errorf("tun.sniffing_settings.destination_override=%v", dest)
 	}
 }
 
@@ -590,5 +589,21 @@ func TestTunCIDREncode(t *testing.T) {
 	}
 	if _, _, err := cidrToIPBase64("not-a-cidr"); err == nil {
 		t.Error("非法 CIDR 应返回错误")
+	}
+}
+
+// TestTunPreopenedFD 校验 st.TunFD>0 时 services.tun 附加 preopened_fd,否则不输出。
+func TestTunPreopenedFD(t *testing.T) {
+	st := testSettings()
+	st.TunEnable = true
+	tun := func() map[string]interface{} {
+		return obj(obj(parseCfg(t, baseServer("vmess"), st), "services"), "tun")
+	}
+	if _, ok := tun()["preopened_fd"]; ok {
+		t.Error("TunFD 为 0 时不应输出 preopened_fd")
+	}
+	st.TunFD = 7
+	if v := tun()["preopened_fd"]; v != float64(7) {
+		t.Errorf("preopened_fd=%v, want 7", v)
 	}
 }
