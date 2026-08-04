@@ -26,10 +26,9 @@ go build -o v2ray-gui .
 3. 「连接」;TUN 模式自动通过 pkexec 请求 root
 
 ## 发行
-打 v* tag 触发 GitHub Actions 自动构建:
-- Windows:amd64 / arm64 / 386(便携 zip)
-- Linux:amd64 / arm64 / arm / 386(二进制 zip)
-- deb / rpm 包:amd64 / arm64,安装自动注册桌面快捷方式与图标
+打 v* tag 触发 GitHub Actions 自动构建(native 构建,不交叉编译):
+- Windows:amd64 便携 zip + NSIS 安装程序(自动创建桌面快捷方式)
+- Linux:amd64 / arm64,每个架构 tar.gz 独立包 + AppImage + deb + rpm
 
 ## 许可
 MIT(内嵌 v2ray-core,见 LICENSE);字体 SIL OFL 1.1(assets/fonts/LICENSE)。

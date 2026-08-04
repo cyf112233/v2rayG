@@ -5,13 +5,15 @@
 #   - workflow_dispatch(手动)→ 仅构建与打包(无 tag,跳过发布)
 #
 # 说明:
-#   - Fyne 是 CGO 应用,跨架构编译使用官方 fyne-cross(docker 镜像内置各平台工具链)
-#   - v2ray-gui 模块位于仓库子目录,go.mod 通过 replace ../ 引用仓库根的 v2ray-core,
-#     因此 fyne-cross 必须从「仓库根」运行并把包参数设为 v2ray-gui
-#     (不能用 -dir v2ray-gui:那会把容器挂载根收窄到子目录,replace ../ 将解析失败)
-#   - fyne-cross 产物位于 fyne-cross/bin/<os>-<arch>/<name>,按 <os>-<arch> 目录区分架构
-#     (fyne-cross 的 -name/-output 是纯字符串,不支持 {{.OS}}/{{.Arch}} 模板)
-#   - deb/rpm 使用 nfpm(nfpm package -f <cfg> -p <deb|rpm> -t <out>)
+#   - Fyne 是 CGO 应用;本工作流采用「原生分叉构建」,不做交叉编译:
+#       * Linux amd64 → ubuntu-24.04(原生)
+#       * Linux arm64 → ubuntu-24.04-arm(公开仓库可用 arm64 原生 runner)
+#       * Windows amd64 → windows-latest(原生,choco 装 mingw 提供 cgo 的 gcc)
+#   - 版本号从 tag 提取(去掉前导 v),workflow_dispatch 时回退 0.0.0
+#   - Linux 每架构产物:tar.gz 独立包 + AppImage + deb + rpm
+#   - Windows 产物:便携 zip + NSIS 安装程序(桌面快捷方式 + 卸载器)
+#   - Windows 图标/版本资源用 go-winres simply 生成 .syso,由 go build 自动链接
+#   - 所有路径相对仓库根;GOTOOLCHAIN 不设(默认 auto,runner 上 go 1.26 已够)
 
 name: Build v2ray-gui Release
 
@@ -25,15 +27,24 @@ permissions:
   contents: write
 
 env:
-  # 使用本地 Go 工具链(不打散 setup-go 版本)
-  GOTOOLCHAIN: local
   # tag 为 v1.2.3;手动触发(无 tag)时用占位版本,仅用于打包测试,不会发布
-  VER: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.0.0' }}
+  VER: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '0.0.0' }}
 
 jobs:
-  build:
-    name: Build and package v2ray-gui
-    runs-on: ubuntu-latest
+  # ------------------------------------------------------------------
+  # Job 1: Linux 原生构建(matrix:amd64 → ubuntu-24.04,arm64 → ubuntu-24.04-arm)
+  # ------------------------------------------------------------------
+  build-linux:
+    name: build-linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     timeout-minutes: 120
     steps:
       - name: Checkout
@@ -44,103 +55,72 @@ jobs:
         with:
           go-version: '1.26.x'
 
-      - name: Add GOPATH/bin to PATH
-        run: echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
-
-      # ---------------------------------------------------------------
-      # fyne-cross 跨架构构建(docker 镜像内置工具链)
-      # ---------------------------------------------------------------
-      - name: Install fyne-cross
-        run: go install github.com/fyne-io/fyne-cross@latest
-
-      - name: fyne-cross build Linux (amd64 / arm64 / arm / 386)
+      - name: Install native build dependencies (cgo)
         run: |
           set -euxo pipefail
-          fyne-cross linux \
-            -arch amd64,arm64,arm,386 \
-            -name v2ray-gui \
-            -icon v2ray-gui/internal/app/assets/icon.png \
-            -app-version "${VER#v}" \
-            v2ray-gui
-        timeout-minutes: 60
+          sudo apt-get update
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
 
-      - name: fyne-cross build Windows (amd64 / arm64 / 386)
+      - name: Build v2ray-gui (native)
         run: |
           set -euxo pipefail
-          fyne-cross windows \
-            -arch amd64,arm64,386 \
-            -name v2ray-gui \
-            -icon v2ray-gui/internal/app/assets/icon.png \
-            -app-version "${VER#v}" \
-            v2ray-gui
-        timeout-minutes: 60
+          cd v2ray-gui
+          go build -trimpath -ldflags "-s -w" -o v2ray-gui .
 
-      # ---------------------------------------------------------------
-      # 收集 fyne-cross 产物(fyne-cross/bin/<os>-<arch>/),按平台打 zip
-      # zip 内附带 README.md 与 LICENSE
-      # ---------------------------------------------------------------
-      - name: Collect binaries and create portable zips
+      - name: Package tar.gz portable archive
         run: |
           set -euxo pipefail
-          APP_VERSION="${VER#v}"
-          mkdir -p release
-          # 公共说明文件(LICENSE 优先取 v2ray-gui/ 下,不存在则回退到仓库根)
-          cp v2ray-gui/README.md release/README.md
-          if [ -f v2ray-gui/LICENSE ]; then
-            cp v2ray-gui/LICENSE release/LICENSE
-          else
-            cp LICENSE release/LICENSE
-          fi
+          VER="${VER#v}"
+          mkdir -p "release/v2ray-gui-linux-${{ matrix.arch }}"
+          cp v2ray-gui/v2ray-gui "release/v2ray-gui-linux-${{ matrix.arch }}/v2ray-gui"
+          cp v2ray-gui/README.md v2ray-gui/LICENSE "release/v2ray-gui-linux-${{ matrix.arch }}/"
+          tar -czf "release/v2ray-gui-${VER}-linux-${{ matrix.arch }}.tar.gz" -C release "v2ray-gui-linux-${{ matrix.arch }}"
+          rm -rf "release/v2ray-gui-linux-${{ matrix.arch }}"
 
-          # Linux:amd64 / arm64 / arm / 386
-          for arch in amd64 arm64 arm 386; do
-            bin="fyne-cross/bin/linux-${arch}/v2ray-gui"
-            [ -f "$bin" ] || { echo "missing: $bin"; exit 1; }
-            dir="release/v2ray-gui-linux-${arch}"
-            mkdir -p "$dir"
-            cp "$bin" "$dir/v2ray-gui"
-            cp release/README.md release/LICENSE "$dir/"
-            (cd release && zip -9r "v2ray-gui_${APP_VERSION}_linux_${arch}.zip" "v2ray-gui-linux-${arch}")
-          done
-
-          # Windows:amd64 / arm64 / 386(exe 单独 zip)
-          for arch in amd64 arm64 386; do
-            bin="fyne-cross/bin/windows-${arch}/v2ray-gui.exe"
-            [ -f "$bin" ] || { echo "missing: $bin"; exit 1; }
-            dir="release/v2ray-gui-windows-${arch}"
-            mkdir -p "$dir"
-            cp "$bin" "$dir/v2ray-gui.exe"
-            cp release/README.md release/LICENSE "$dir/"
-            (cd release && zip -9r "v2ray-gui_${APP_VERSION}_windows_${arch}.zip" "v2ray-gui-windows-${arch}")
-          done
-
-      # ---------------------------------------------------------------
-      # deb / rpm 打包(nfpm),amd64 / arm64
-      # ---------------------------------------------------------------
-      - name: Install nfpm
-        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
-
-      - name: Package deb and rpm (amd64 / arm64)
+      - name: Build AppImage
         run: |
           set -euxo pipefail
-          APP_VERSION="${VER#v}"
-          for arch in amd64 arm64; do
-          case "$arch" in
-          amd64) rpm_arch="x86_64" ;;
-          arm64) rpm_arch="aarch64" ;;
+          VER="${VER#v}"
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/icons/hicolor/512x512/apps
+          cp v2ray-gui/v2ray-gui AppDir/usr/bin/v2ray-gui
+          # AppImage 内的 desktop 文件 Exec 指向包内二进制(不带绝对路径)
+          sed 's|^Exec=.*|Exec=v2ray-gui|' v2ray-gui/packaging/v2ray-gui.desktop > AppDir/usr/share/applications/v2ray-gui.desktop
+          cp AppDir/usr/share/applications/v2ray-gui.desktop AppDir/v2ray-gui.desktop
+          cp v2ray-gui/internal/app/assets/icon.png AppDir/usr/share/icons/hicolor/512x512/apps/v2ray-gui.png
+          echo '#!/bin/sh' > AppDir/AppRun
+          echo 'SELF=$(readlink -f "$0"); HERE=${SELF%/*}; exec "$HERE/usr/bin/v2ray-gui" "$@"' >> AppDir/AppRun
+          chmod +x AppDir/AppRun
+          case "${{ matrix.arch }}" in
+            amd64) APPIMAGE_URL="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage" ;;
+            arm64) APPIMAGE_URL="https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-aarch64.AppImage" ;;
+          esac
+          wget -q "$APPIMAGE_URL" -O appimagetool
+          chmod +x appimagetool
+          # --appimage-extract-and-run:免 FUSE 运行 appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir "release/v2rayG-${VER}-${{ matrix.arch }}.AppImage"
+
+      - name: Package deb and rpm (nfpm)
+        run: |
+          set -euxo pipefail
+          VER="${VER#v}"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest || go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.3
+          case "${{ matrix.arch }}" in
+            amd64) rpm_arch="x86_64" ;;
+            arm64) rpm_arch="aarch64" ;;
           esac
           # 注意:heredoc 内容与 EOF 必须与块基准缩进一致,YAML 剥离后 bash 端全部回到列 0
-          cat > "nfpm-${arch}.yaml" <<EOF
+          cat > "nfpm-${{ matrix.arch }}.yaml" <<EOF
           name: v2ray-gui
-          arch: ${arch}
+          arch: ${{ matrix.arch }}
           platform: linux
-          version: ${APP_VERSION}
+          version: ${VER}
           maintainer: v2rayG <v2ray-gui@users.noreply.github.com>
           homepage: https://github.com/v2fly/v2ray-core
-          license: GPL-3.0
+          license: MIT
           description: v2rayG - Fyne GUI client with embedded v2ray-core
           contents:
-            - src: fyne-cross/bin/linux-${arch}/v2ray-gui
+            - src: v2ray-gui/v2ray-gui
               dst: /usr/bin/v2ray-gui
             - src: v2ray-gui/packaging/v2ray-gui.desktop
               dst: /usr/share/applications/v2ray-gui.desktop
@@ -149,23 +129,126 @@ jobs:
           scripts:
             postinstall: v2ray-gui/packaging/postinstall.sh
           EOF
-          nfpm package -f "nfpm-${arch}.yaml" -p deb -t "release/v2ray-gui_${APP_VERSION}_${arch}.deb"
-          nfpm package -f "nfpm-${arch}.yaml" -p rpm -t "release/v2ray-gui-${APP_VERSION}.${rpm_arch}.rpm"
-          done
+          nfpm package -f "nfpm-${{ matrix.arch }}.yaml" -p deb -t "release/v2ray-gui_${VER}_${{ matrix.arch }}.deb"
+          nfpm package -f "nfpm-${{ matrix.arch }}.yaml" -p rpm -t "release/v2ray-gui-${VER}.${rpm_arch}.rpm"
 
       - name: List release artifacts
         run: ls -lh release/
 
-      # ---------------------------------------------------------------
-      # 发布为 draft Release(仅 tag 推送时;draft 便于人工检查后再发布)
-      # ---------------------------------------------------------------
-      - name: Publish to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2ray-gui-linux-${{ matrix.arch }}
+          path: release/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Job 2: Windows 原生构建(windows-latest,amd64)
+  # ------------------------------------------------------------------
+  build-windows:
+    name: build-windows (amd64)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+
+      - name: Install mingw (cgo gcc)
+        run: |
+          set -euxo pipefail
+          choco install mingw -y --no-progress
+          echo "C:\\ProgramData\\chocolatey\\lib\\mingw\\tools\\install\\mingw64\\bin" >> "$GITHUB_PATH"
+          export PATH="/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin:$PATH"
+          gcc --version
+
+      - name: Embed icon and version resources (go-winres)
+        run: |
+          set -euxo pipefail
+          VER="${VER#v}"
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          go install github.com/tc-hib/go-winres@latest
+          cd v2ray-gui
+          # 生成 rsrc_windows_amd64.syso,go build 自动链接进 exe
+          go-winres simply \
+            --arch amd64 \
+            --icon internal/app/assets/icon.png \
+            --manifest gui \
+            --file-description "v2rayG - V2Ray GUI client" \
+            --product-name "v2rayG" \
+            --original-filename "v2ray-gui.exe" \
+            --file-version "${VER}.0" --product-version "${VER}.0"
+          ls -l rsrc_windows_*.syso
+
+      - name: Build v2ray-gui.exe (native)
+        run: |
+          set -euxo pipefail
+          cd v2ray-gui
+          go build -trimpath -ldflags "-s -w" -o v2ray-gui.exe .
+          SIZE=$(stat -c%s v2ray-gui.exe)
+          echo "v2ray-gui.exe size: $SIZE bytes"
+          [ "$SIZE" -gt 83886080 ] || echo "::warning::exe smaller than 80MB, embedded resources may be missing"
+
+      - name: Package portable zip
+        run: |
+          set -euxo pipefail
+          VER="${VER#v}"
+          mkdir -p "release/v2ray-gui-windows-amd64"
+          cp v2ray-gui/v2ray-gui.exe "release/v2ray-gui-windows-amd64/v2ray-gui.exe"
+          cp v2ray-gui/README.md v2ray-gui/LICENSE "release/v2ray-gui-windows-amd64/"
+          powershell -NoProfile -Command "Compress-Archive -Path 'release/v2ray-gui-windows-amd64/*' -DestinationPath 'release/v2ray-gui-${VER}-windows-amd64.zip' -Force"
+
+      - name: Build NSIS installer
+        run: |
+          set -euxo pipefail
+          VER="${VER#v}"
+          choco install nsis -y --no-progress
+          # -D 传参:VERSION 写进安装包与注册表,APP_ROOT/OUTDIR 为绝对路径(免去 NSIS 相对路径歧义)
+          makensis "-DVERSION=${VER}" \
+            "-DAPP_ROOT=${GITHUB_WORKSPACE//\\//}" \
+            "-DOUTDIR=${GITHUB_WORKSPACE//\\//}/release" \
+            v2ray-gui/packaging/installer.nsi
+          ls -lh "release/v2rayG-Setup-${VER}.exe"
+
+      - name: List release artifacts
+        run: ls -lh release/
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: v2ray-gui-windows-amd64
+          path: release/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # Job 3: 汇总所有产物并发布 draft Release(仅 tag 推送时)
+  # ------------------------------------------------------------------
+  release:
+    name: Release (draft)
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release/
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: ls -lh release/
+
+      - name: Publish draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/*.zip
-            release/*.deb
-            release/*.rpm
+          files: release/*
           draft: true
           generate_release_notes: true
