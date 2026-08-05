@@ -75,11 +75,11 @@ jobs:
         run: |
           set -euxo pipefail
           VER="${VER#v}"
-          mkdir -p "release/v2ray-gui-linux-${{ matrix.arch }}"
-          cp v2ray-gui/v2ray-gui "release/v2ray-gui-linux-${{ matrix.arch }}/v2ray-gui"
-          cp v2ray-gui/README.md v2ray-gui/LICENSE "release/v2ray-gui-linux-${{ matrix.arch }}/"
-          tar -czf "release/v2ray-gui-${VER}-linux-${{ matrix.arch }}.tar.gz" -C release "v2ray-gui-linux-${{ matrix.arch }}"
-          rm -rf "release/v2ray-gui-linux-${{ matrix.arch }}"
+          mkdir -p "upload/v2ray-gui-linux-${{ matrix.arch }}"
+          cp v2ray-gui/v2ray-gui "upload/v2ray-gui-linux-${{ matrix.arch }}/v2ray-gui"
+          cp v2ray-gui/README.md v2ray-gui/LICENSE "upload/v2ray-gui-linux-${{ matrix.arch }}/"
+          tar -czf "upload/v2ray-gui-${VER}-linux-${{ matrix.arch }}.tar.gz" -C upload "v2ray-gui-linux-${{ matrix.arch }}"
+          rm -rf "upload/v2ray-gui-linux-${{ matrix.arch }}"
 
       - name: Build AppImage
         run: |
@@ -104,7 +104,7 @@ jobs:
           wget -q "$APPIMAGE_URL" -O appimagetool
           chmod +x appimagetool
           # --appimage-extract-and-run:免 FUSE 运行 appimagetool
-          ./appimagetool --appimage-extract-and-run AppDir "release/v2rayG-${VER}-${{ matrix.arch }}.AppImage"
+          ./appimagetool --appimage-extract-and-run AppDir "upload/v2rayG-${VER}-${{ matrix.arch }}.AppImage"
 
       - name: Package deb and rpm (nfpm)
         run: |
@@ -140,17 +140,17 @@ jobs:
           scripts:
             postinstall: v2ray-gui/packaging/postinstall.sh
           EOF
-          nfpm package -f "nfpm-${{ matrix.arch }}.yaml" -p deb -t "release/v2ray-gui_${VER}_${{ matrix.arch }}.deb"
-          nfpm package -f "nfpm-${{ matrix.arch }}.yaml" -p rpm -t "release/v2ray-gui-${VER}.${rpm_arch}.rpm"
+          nfpm package -f "nfpm-${{ matrix.arch }}.yaml" -p deb -t "upload/v2ray-gui_${VER}_${{ matrix.arch }}.deb"
+          nfpm package -f "nfpm-${{ matrix.arch }}.yaml" -p rpm -t "upload/v2ray-gui-${VER}.${rpm_arch}.rpm"
 
       - name: List release artifacts
-        run: ls -lh release/
+        run: ls -lh upload/
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: v2ray-gui-linux-${{ matrix.arch }}
-          path: release/*
+          path: upload/*
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -211,10 +211,10 @@ jobs:
         run: |
           set -euxo pipefail
           VER="${VER#v}"
-          mkdir -p "release/v2ray-gui-windows-amd64"
-          cp v2ray-gui/v2ray-gui.exe "release/v2ray-gui-windows-amd64/v2ray-gui.exe"
-          cp v2ray-gui/README.md v2ray-gui/LICENSE "release/v2ray-gui-windows-amd64/"
-          powershell -NoProfile -Command "Compress-Archive -Path 'release/v2ray-gui-windows-amd64/*' -DestinationPath 'release/v2ray-gui-${VER}-windows-amd64.zip' -Force"
+          mkdir -p "upload/v2ray-gui-windows-amd64"
+          cp v2ray-gui/v2ray-gui.exe "upload/v2ray-gui-windows-amd64/v2ray-gui.exe"
+          cp v2ray-gui/README.md v2ray-gui/LICENSE "upload/v2ray-gui-windows-amd64/"
+          powershell -NoProfile -Command "Compress-Archive -Path 'upload/v2ray-gui-windows-amd64/*' -DestinationPath 'upload/v2ray-gui-${VER}-windows-amd64.zip' -Force"
 
       - name: Build NSIS installer
         run: |
@@ -226,9 +226,9 @@ jobs:
           # -D 传参:VERSION 写进安装包与注册表,APP_ROOT/OUTDIR 为绝对路径(免去 NSIS 相对路径歧义)
           makensis "-DVERSION=${VER}" \
             "-DAPP_ROOT=${GITHUB_WORKSPACE//\\//}" \
-            "-DOUTDIR=${GITHUB_WORKSPACE//\\//}/release" \
+            "-DOUTDIR=${GITHUB_WORKSPACE//\\//}/upload" \
             v2ray-gui/packaging/installer.nsi
-          ls -lh "release/v2rayG-Setup-${VER}.exe"
+          ls -lh "upload/v2rayG-Setup-${VER}.exe"
 
       - name: Install llvm-mingw (aarch64-w64-mingw32 cross compiler)
         run: |
@@ -272,20 +272,20 @@ jobs:
         run: |
           set -euxo pipefail
           VER="${VER#v}"
-          mkdir -p "release/v2ray-gui-windows-arm64"
-          cp v2ray-gui/v2ray-gui-arm64.exe "release/v2ray-gui-windows-arm64/v2ray-gui.exe"
-          cp v2ray-gui/README.md v2ray-gui/LICENSE "release/v2ray-gui-windows-arm64/"
-          powershell -NoProfile -Command "Compress-Archive -Path 'release/v2ray-gui-windows-arm64/*' -DestinationPath 'release/v2ray-gui-${VER}-windows-arm64.zip' -Force"
+          mkdir -p "upload/v2ray-gui-windows-arm64"
+          cp v2ray-gui/v2ray-gui-arm64.exe "upload/v2ray-gui-windows-arm64/v2ray-gui.exe"
+          cp v2ray-gui/README.md v2ray-gui/LICENSE "upload/v2ray-gui-windows-arm64/"
+          powershell -NoProfile -Command "Compress-Archive -Path 'upload/v2ray-gui-windows-arm64/*' -DestinationPath 'upload/v2ray-gui-${VER}-windows-arm64.zip' -Force"
           # 注:arm64 不做 NSIS 安装器,仅便携 zip
 
       - name: List release artifacts
-        run: ls -lh release/
+        run: ls -lh upload/
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: v2ray-gui-windows
-          path: release/*
+          path: upload/*
           if-no-files-found: error
 
   # ------------------------------------------------------------------
@@ -301,15 +301,15 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: release/
+          path: upload/
           merge-multiple: true
 
       - name: List release artifacts
-        run: ls -lh release/
+        run: ls -lh upload/
 
       - name: Publish draft GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*
+          files: upload/*
           draft: true
           generate_release_notes: true
